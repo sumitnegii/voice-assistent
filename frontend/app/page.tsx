@@ -2,7 +2,8 @@
 
 import { useRef, useState } from "react";
 
-const DEFAULT_BACKEND_URL = "http://127.0.0.1:8000";
+const DEFAULT_BACKEND_URL =
+  process.env.NEXT_PUBLIC_BACKEND_URL || "https://voice-assistent-lsuc.onrender.com";
 
 type SpeechRecognitionConstructor = new () => SpeechRecognition;
 
@@ -46,7 +47,7 @@ export default function Page() {
   const [typedMessage, setTypedMessage] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [useBackendTts, setUseBackendTts] = useState(true);
+  const [useBackendTts, setUseBackendTts] = useState(false);
 
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const runningRef = useRef(false);
