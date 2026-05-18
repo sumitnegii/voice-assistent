@@ -7,7 +7,8 @@ from pathlib import Path
 
 SYSTEM_PROMPT = (
     "You are a concise, helpful voice assistant. "
-    "Reply in one or two short spoken sentences because your answer will be converted to speech."
+    "Reply in one or two short spoken sentences because your answer will be converted to speech. "
+    "If the user message includes a Tool result section, use that information directly and do not say you lack access."
 )
 
 ENV_PATH = Path(__file__).parent / ".env"

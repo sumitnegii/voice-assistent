@@ -2,6 +2,7 @@ fastapi>=0.116.1
 uvicorn[standard]>=0.35.0
 python-multipart>=0.0.20
 faster-whisper>=1.1.1
+edge-tts>=7.2.3
 # XTTS-v2 is provided by Coqui TTS. It may not install on Python 3.13.
 # Prefer Python 3.10 or 3.11 for this dependency.
 TTS>=0.22.0; python_version < "3.12"

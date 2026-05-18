@@ -10,10 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from llm import generate_reply
-from stt import _get_model, transcribe_audio
-from tools import run_tools
-from tts import synthesize_speech
+from stt import _get_model
+from voice_pipeline import run_audio_pipeline, run_text_pipeline, synthesize_pipeline_reply
 
 
 app = FastAPI(title="Voice Assistant Prototype")
@@ -46,6 +44,8 @@ UPLOAD_DIR = Path(__file__).parent / "uploads"
 
 class ChatRequest(BaseModel):
     message: str
+    language: str | None = None
+    voice_style: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -72,20 +72,25 @@ def warmup_models() -> None:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
-    reply = generate_reply(request.message)
-    return ChatResponse(reply=reply)
+    result = run_text_pipeline(request.message)
+    return ChatResponse(reply=result.reply)
 
 
 @app.post("/speak")
 def speak(request: ChatRequest) -> FileResponse:
     try:
-        audio_path = synthesize_speech(request.message)
+        audio_path, timings = synthesize_pipeline_reply(
+            request.message,
+            language=request.language,
+            voice_style=request.voice_style,
+        )
+        print("speak tts:", f"{timings.tts_seconds:.2f}s")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return FileResponse(
         audio_path,
-        media_type="audio/wav",
+        media_type=_audio_media_type(audio_path),
         filename=audio_path.name,
     )
 
@@ -100,15 +105,14 @@ def voice_chat(
         raise HTTPException(status_code=204, detail="Ignored noisy audio.")
 
     try:
-        tts_started_at = time.perf_counter()
-        audio_path = synthesize_speech(reply)
-        print("voice-chat tts:", f"{time.perf_counter() - tts_started_at:.2f}s")
+        audio_path, timings = synthesize_pipeline_reply(reply, language=language)
+        print("voice-chat tts:", f"{timings.tts_seconds:.2f}s")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return FileResponse(
         audio_path,
-        media_type="audio/wav",
+        media_type=_audio_media_type(audio_path),
         filename=audio_path.name,
         headers={
             "x-transcript-b64": _encode_header(transcript),
@@ -135,21 +139,12 @@ def _run_voice_brain(file: UploadFile, language: str | None) -> tuple[str, str, 
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        started_at = time.perf_counter()
-        transcript = transcribe_audio(upload_path, _normalize_language(language))
-        asr_done_at = time.perf_counter()
-        tool_context = run_tools(transcript)
-        llm_message = transcript
-        if tool_context:
-            llm_message = f"{transcript}\n\nTool result:\n{tool_context}"
-
-        reply = generate_reply(llm_message)
-        llm_done_at = time.perf_counter()
+        result, timings = run_audio_pipeline(upload_path, _normalize_language(language))
         print(
             "voice-brain timings:",
-            f"asr={asr_done_at - started_at:.2f}s",
-            f"llm={llm_done_at - asr_done_at:.2f}s",
-            f"total={llm_done_at - started_at:.2f}s",
+            f"asr={timings.asr_seconds:.2f}s",
+            f"llm={timings.llm_seconds:.2f}s",
+            f"total={timings.total_seconds:.2f}s",
         )
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
@@ -166,11 +161,17 @@ def _run_voice_brain(file: UploadFile, language: str | None) -> tuple[str, str, 
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return transcript, reply, False
+    return result.transcript, result.reply, False
 
 
 def _encode_header(value: str) -> str:
     return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def _audio_media_type(audio_path: Path) -> str:
+    if audio_path.suffix.lower() == ".mp3":
+        return "audio/mpeg"
+    return "audio/wav"
 
 
 def _normalize_language(language: str | None) -> str | None:
