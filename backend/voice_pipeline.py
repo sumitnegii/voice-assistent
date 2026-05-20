@@ -24,24 +24,29 @@ class VoicePipelineTimings:
     total_seconds: float = 0
 
 
-def run_text_pipeline(message: str) -> VoicePipelineResult:
+def run_text_pipeline(
+    message: str,
+    language: str | None = None,
+    voice_style: str | None = None,
+) -> VoicePipelineResult:
     """Pipecat-style text pipeline: user text -> tools/context -> LLM reply."""
     cleaned = message.strip()
     tool_context = run_tools(cleaned)
-    reply = generate_reply(_message_with_tool_context(cleaned, tool_context))
+    reply = generate_reply(_message_with_tool_context(cleaned, tool_context), language, voice_style)
     return VoicePipelineResult(transcript=cleaned, reply=reply, tool_context=tool_context)
 
 
 def run_audio_pipeline(
     audio_path: Path,
     language: str | None,
+    voice_style: str | None = None,
 ) -> tuple[VoicePipelineResult, VoicePipelineTimings]:
     """Pipecat-style audio brain: audio -> STT -> tools/context -> LLM reply."""
     started_at = time.perf_counter()
     transcript = transcribe_audio(audio_path, language)
     asr_done_at = time.perf_counter()
 
-    text_result = run_text_pipeline(transcript)
+    text_result = run_text_pipeline(transcript, language, voice_style=voice_style)
     llm_done_at = time.perf_counter()
 
     timings = VoicePipelineTimings(

@@ -1,6 +1,7 @@
 import base64
 import os
 import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -40,6 +41,12 @@ app.add_middleware(
 )
 
 UPLOAD_DIR = Path(__file__).parent / "uploads"
+DEDUP_WINDOW_SECONDS = float(os.getenv("REQUEST_DEDUP_WINDOW_SECONDS", "4"))
+_CHAT_RESULTS: dict[tuple[str, str], tuple[float, str]] = {}
+_CHAT_IN_FLIGHT: dict[tuple[str, str], threading.Event] = {}
+_CHAT_LOCK = threading.Lock()
+_SPEAK_IN_FLIGHT: set[tuple[str, str, str]] = set()
+_SPEAK_LOCK = threading.Lock()
 
 
 class ChatRequest(BaseModel):
@@ -72,21 +79,71 @@ def warmup_models() -> None:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
-    result = run_text_pipeline(request.message)
-    return ChatResponse(reply=result.reply)
+    language = _normalize_language(request.language)
+    key = _request_key(request.message, language)
+    request_id = uuid.uuid4().hex[:8]
+    wait_for: threading.Event | None = None
+
+    with _CHAT_LOCK:
+      cached = _CHAT_RESULTS.get(key)
+      if cached and time.monotonic() - cached[0] <= DEDUP_WINDOW_SECONDS:
+          print("chat duplicate cached:", request_id, f"language={language}", f"message={request.message!r}")
+          return ChatResponse(reply=cached[1])
+
+      wait_for = _CHAT_IN_FLIGHT.get(key)
+      if wait_for is None:
+          wait_for = threading.Event()
+          _CHAT_IN_FLIGHT[key] = wait_for
+          should_process = True
+      else:
+          should_process = False
+
+    if not should_process:
+        print("chat duplicate waiting:", request_id, f"language={language}", f"message={request.message!r}")
+        wait_for.wait(timeout=60)
+        with _CHAT_LOCK:
+            cached = _CHAT_RESULTS.get(key)
+        if cached:
+            return ChatResponse(reply=cached[1])
+        raise HTTPException(status_code=409, detail="Duplicate chat request did not complete.")
+
+    print("chat start:", request_id, f"language={language}", f"message={request.message!r}")
+    started_at = time.perf_counter()
+    try:
+        result = run_text_pipeline(request.message, language, voice_style=request.voice_style)
+        with _CHAT_LOCK:
+            _CHAT_RESULTS[key] = (time.monotonic(), result.reply)
+        print("chat done:", request_id, f"{time.perf_counter() - started_at:.2f}s", f"reply={result.reply!r}")
+        return ChatResponse(reply=result.reply)
+    finally:
+        with _CHAT_LOCK:
+            event = _CHAT_IN_FLIGHT.pop(key, None)
+            if event:
+                event.set()
 
 
 @app.post("/speak")
 def speak(request: ChatRequest) -> FileResponse:
+    key = _speak_key(request)
+    request_id = uuid.uuid4().hex[:8]
+    with _SPEAK_LOCK:
+        if key in _SPEAK_IN_FLIGHT:
+            print("speak duplicate rejected:", request_id, f"message={request.message!r}")
+            raise HTTPException(status_code=409, detail="Duplicate TTS request already in progress.")
+        _SPEAK_IN_FLIGHT.add(key)
+
     try:
         audio_path, timings = synthesize_pipeline_reply(
             request.message,
             language=request.language,
             voice_style=request.voice_style,
         )
-        print("speak tts:", f"{timings.tts_seconds:.2f}s")
+        print("speak tts:", request_id, f"{timings.tts_seconds:.2f}s", f"message={request.message!r}")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        with _SPEAK_LOCK:
+            _SPEAK_IN_FLIGHT.discard(key)
 
     return FileResponse(
         audio_path,
@@ -99,13 +156,14 @@ def speak(request: ChatRequest) -> FileResponse:
 def voice_chat(
     file: UploadFile = File(...),
     language: str | None = Form(default=None),
+    voice_style: str | None = Form(default=None),
 ) -> FileResponse:
-    transcript, reply, ignored = _run_voice_brain(file, language)
+    transcript, reply, ignored = _run_voice_brain(file, language, voice_style)
     if ignored:
         raise HTTPException(status_code=204, detail="Ignored noisy audio.")
 
     try:
-        audio_path, timings = synthesize_pipeline_reply(reply, language=language)
+        audio_path, timings = synthesize_pipeline_reply(reply, language=language, voice_style=voice_style)
         print("voice-chat tts:", f"{timings.tts_seconds:.2f}s")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -125,12 +183,17 @@ def voice_chat(
 def voice_chat_text(
     file: UploadFile = File(...),
     language: str | None = Form(default=None),
+    voice_style: str | None = Form(default=None),
 ) -> VoiceChatTextResponse:
-    transcript, reply, ignored = _run_voice_brain(file, language)
+    transcript, reply, ignored = _run_voice_brain(file, language, voice_style)
     return VoiceChatTextResponse(transcript=transcript, reply=reply, ignored=ignored)
 
 
-def _run_voice_brain(file: UploadFile, language: str | None) -> tuple[str, str, bool]:
+def _run_voice_brain(
+    file: UploadFile,
+    language: str | None,
+    voice_style: str | None = None,
+) -> tuple[str, str, bool]:
     UPLOAD_DIR.mkdir(exist_ok=True)
     suffix = Path(file.filename or "audio.webm").suffix or ".webm"
     upload_path = UPLOAD_DIR / f"input-{uuid.uuid4().hex}{suffix}"
@@ -139,7 +202,7 @@ def _run_voice_brain(file: UploadFile, language: str | None) -> tuple[str, str, 
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        result, timings = run_audio_pipeline(upload_path, _normalize_language(language))
+        result, timings = run_audio_pipeline(upload_path, _normalize_language(language), voice_style=voice_style)
         print(
             "voice-brain timings:",
             f"asr={timings.asr_seconds:.2f}s",
@@ -178,3 +241,15 @@ def _normalize_language(language: str | None) -> str | None:
     if not language or language == "auto":
         return None
     return language
+
+
+def _request_key(message: str, language: str | None) -> tuple[str, str]:
+    return (language or "", " ".join(message.casefold().split()))
+
+
+def _speak_key(request: ChatRequest) -> tuple[str, str, str]:
+    return (
+        request.language or "",
+        request.voice_style or "",
+        " ".join(request.message.casefold().split()),
+    )
